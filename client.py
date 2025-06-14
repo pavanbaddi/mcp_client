@@ -12,14 +12,15 @@ from typing import cast, Any
 import json
 import traceback
 
-load_dotenv()  # load environment variables from .env
+load_dotenv()
 
 class MCPClient:
     def __init__(self):
-        # Initialize session and client objects
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
         self.anthropic = Anthropic()
+        """"Keep context of messages"""
+        self.messages: list[MessageParam] = []
 
     async def connect_to_server(self, server_script_path: str):
         """Connect to an MCP server
@@ -50,11 +51,14 @@ class MCPClient:
         tools = response.tools
         print("\nConnected to server with tools:", [tool.name for tool in tools])
 
+    async def clear_history(self):
+        """Clear the conversation history"""
+        self.messages = []
+        print("Conversation history cleared.")
+
     async def process_query(self, query: str) -> str:
         """Process a query using Claude and available tools"""
-        messages = [
-            MessageParam(role="user", content=query)
-        ]
+        self.messages.append(MessageParam(role="user", content=query))
         
         if not self.session:
             raise RuntimeError("Client session is not initialized. Please connect to the server first.")
@@ -68,11 +72,11 @@ class MCPClient:
             ) for tool in response.tools
         ]
 
-        # Initial Claude API call
+        # Initial Claude API call with full message history
         response = self.anthropic.messages.create(
             model="claude-3-5-sonnet-20241022",
             max_tokens=1000,
-            messages=messages,
+            messages=self.messages,
             tools=available_tools
         )
 
@@ -83,69 +87,69 @@ class MCPClient:
         for content in response.content:
             if content.type == 'text':
                 final_text.append(content.text)
+                self.messages.append(MessageParam(role="assistant", content=content.text))
             elif content.type == 'tool_use':
                 tool_name = content.name
                 tool_args = cast(dict[str, Any], content.input)
                 
                 print(f"\nCalling tool: {tool_name} with args:", tool_args)
-            # Execute tool call
+                
+                if hasattr(content, 'input') and content.input:
+                    content_input = json.dumps(content.input)
+                    self.messages.append(MessageParam(
+                        role="assistant",
+                        content=content_input
+                    ))
+
+                # tool call
                 result = await self.session.call_tool(tool_name, tool_args)
                 result_content = result.content[0].text if len(result.content) > 0 and result.content[0].type == 'text' else None
                 tool_results.append({"call": tool_name, "result": result})
                 final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
                 
-                # Continue conversation with tool results
-                if hasattr(content, 'input') and content.input:
-                    content_input = json.dumps(content.input)
-                    messages.append({
-                        "role": "assistant",
-                        "content": content_input
-                    })
-                    
+                # Add tool result to message history
+                self.messages.append(MessageParam(
+                    role="user",
+                    content=result_content or "No result returned from tool."
+                ))
 
-                messages.append({
-                    "role": "user", 
-                    "content": result_content or "No result returned from tool."
-                })  
-
-                # print("debug messgaes:", messages)
-                # Get next response from Claude
+                # Get next response from Claude with updated history
                 response = self.anthropic.messages.create(
                     model="claude-3-5-sonnet-20241022",
                     max_tokens=1000,
-                    messages=messages,
+                    messages=self.messages,
+                    tools=available_tools
                 )
 
-                # print("debug response:", response)
-
                 first_input = response.content[0].text if len(response.content) > 0 and response.content[0].type == 'text' else None
-                
-                # print("debug first_input:", first_input)
-                final_text.append(first_input)
+                if first_input:
+                    final_text.append(first_input)
+                    # Add assistant's response to message history
+                    self.messages.append(MessageParam(role="assistant", content=first_input))
 
         return "\n".join(final_text)
 
     async def chat_loop(self):
         """Run an interactive chat loop"""
         print("\nMCP Client Started!")
-        print("Type your queries or 'quit' to exit.")
+        print("Type your queries, 'clear' to clear conversation history, or 'quit' to exit.")
         
         while True:
             try:
                 query = input("\nQuery: ").strip()
-                # query = "\nQuery: Get leave history of employee E001".strip()
                 
                 if query.lower() == 'quit':
                     break
+                elif query.lower() == 'clear':
+                    await self.clear_history()
+                    continue
                     
                 response = await self.process_query(query)
                 print("\n" + response)
-                # break
                     
             except Exception as e:
                 print(f"\nError in chat_loop", e)
                 traceback.print_exc()
-                
     
     async def cleanup(self):
         """Clean up resources"""
